@@ -75,6 +75,12 @@ def sanitize_filename(name: Optional[str]) -> str:
     return name
 
 
+def sanitize_mailbox_for_path(mailbox: str) -> str:
+    s = mailbox.strip().replace(os.sep, "_")
+    s = re.sub(r"[^A-Za-z0-9_.-]+", "_", s)
+    return s or "mailbox"
+
+
 def parse_addresses(header_value: Optional[str]) -> List[Dict[str, str]]:
     if not header_value:
         return []
@@ -258,6 +264,14 @@ class ImapSession:
         typ, _ = self.conn.select(self.config.mailbox, readonly=self.config.readonly)
         if typ != "OK":
             raise RuntimeError(f"Failed to select mailbox {self.config.mailbox}")
+
+    def select(self, mailbox: str) -> None:
+        """Select a different mailbox, respecting readonly flag."""
+        assert self.conn is not None
+        self.config.mailbox = mailbox
+        typ, _ = self.conn.select(mailbox, readonly=self.config.readonly)
+        if typ != "OK":
+            raise RuntimeError(f"Failed to select mailbox {mailbox}")
 
     def close(self) -> None:
         if self.conn is not None:
@@ -507,7 +521,8 @@ def decode_text_payload(part: Message) -> str:
 
 def extract_bodies_and_attachments(msg: EmailMessage,
                                    attachments_dir: Optional[str],
-                                   uid: str) -> Tuple[ParsedBody, List[Dict[str, Any]]]:
+                                   uid: str,
+                                   mailbox: str) -> Tuple[ParsedBody, List[Dict[str, Any]]]:
     body_text_candidates: List[str] = []
     body_html_candidates: List[str] = []
     attachments: List[Dict[str, Any]] = []
@@ -554,7 +569,8 @@ def extract_bodies_and_attachments(msg: EmailMessage,
             if attachments_dir:
                 try:
                     os.makedirs(attachments_dir, exist_ok=True)
-                    safe_name = filename or f"attachment_{uid}_{part_index}"
+                    mbox_safe = sanitize_mailbox_for_path(mailbox)
+                    safe_name = filename or f"attachment_{mbox_safe}_{uid}_{part_index}"
                     base, ext = os.path.splitext(safe_name)
                     # Ensure uniqueness
                     target = os.path.join(attachments_dir, f"{base}_{uid}_{part_index}{ext}")
@@ -589,172 +605,195 @@ def extract_bodies_and_attachments(msg: EmailMessage,
 # Main export logic
 # -----------------------------
 
-def export_mailbox(config: ImapConfig,
-                   out_path: str,
-                   limit: Optional[int],
-                   attachments_dir: Optional[str],
-                   batch_size: int,
-                   logger: logging.Logger) -> None:
+def export_mailboxes(config: ImapConfig,
+                    mailboxes: List[str],
+                    out_path: str,
+                    limit: Optional[int],
+                    attachments_dir: Optional[str],
+                    batch_size: int,
+                    logger: logging.Logger) -> None:
+    """Export one or more mailboxes, computing conversation IDs across all of them and writing a single NDJSON file."""
     session = ImapSession(config, logger)
     include_gmail = any(c == b"X-GM-EXT-1" for c in session.capabilities)
 
-    # 1) Get all UIDs
-    _, data = session.uid("SEARCH", None, "ALL")
-    if not data or not data[0]:
-        logger.info("No messages found.")
-        return
-    raw_uids = data[0].decode("ascii", errors="replace").strip().split()
-    # UID list as strings
-    all_uids = raw_uids
-    if limit is not None and limit > 0:
-        all_uids = all_uids[:limit]
+    # Global maps across all mailboxes
+    global_uid_to_info: Dict[Tuple[str, str], MinimalHeaderInfo] = {}
+    global_msgid_to_info: Dict[str, MinimalHeaderInfo] = {}
 
-    total = len(all_uids)
-    logger.info(f"Enumerating {total} messages from mailbox '{config.mailbox}'")
-
-    # 2) Pass 1: fetch minimal headers to compute threading and metadata
-    header_fields = ["Message-ID", "In-Reply-To", "References", "Subject", "From", "To", "Cc", "Bcc", "Date"]
-    uid_to_info: Dict[str, MinimalHeaderInfo] = {}
-    msgid_to_info: Dict[str, MinimalHeaderInfo] = {}
-
-    processed = 0
-    for batch_uids in chunked(all_uids, batch_size):
-        # Fetch headers for batch
+    # First pass across all mailboxes: build header index
+    for mailbox in mailboxes:
         try:
-            batch_headers = fetch_headers_for_uids(session, batch_uids, header_fields)
+            session.select(mailbox)
         except Exception as e:
-            logger.warning(f"Header fetch batch failed; retrying smaller or skipping. Error: {e}")
-            # retry one by one
-            for u in batch_uids:
-                try:
-                    single_headers = fetch_headers_for_uids(session, [u], header_fields)
-                except Exception as e2:
-                    logger.error(f"Failed to fetch headers for UID {u}: {e2}")
-                    continue
-                for (uid, headers_bytes) in single_headers:
-                    info = parse_headers_only(headers_bytes, uid, config.mailbox)
-                    uid_to_info[uid] = info
-                    if info.message_id:
-                        msgid_to_info[info.message_id] = info
-            processed += len(batch_uids)
-            logger.info(f"Header pass progress: {processed}/{total}")
+            logger.error(f"Skipping mailbox '{mailbox}': {e}")
             continue
 
-        for (uid, headers_bytes) in batch_headers:
-            info = parse_headers_only(headers_bytes, uid, config.mailbox)
-            uid_to_info[uid] = info
-            if info.message_id:
-                msgid_to_info[info.message_id] = info
+        _, data = session.uid("SEARCH", None, "ALL")
+        if not data or not data[0]:
+            logger.info(f"No messages found in '{mailbox}'.")
+            continue
+        raw_uids = data[0].decode("ascii", errors="replace").strip().split()
+        uids = raw_uids
+        if limit is not None and limit > 0:
+            uids = uids[:limit]
 
-        processed += len(batch_uids)
-        logger.info(f"Header pass progress: {processed}/{total}")
+        total = len(uids)
+        logger.info(f"Header pass: mailbox '{mailbox}' with {total} messages")
 
-    # 3) Compute conversation roots and IDs
-    uid_to_conversation_id: Dict[str, str] = {}
-    for uid, info in uid_to_info.items():
-        root_mid = compute_root_message_id_for(uid, info, msgid_to_info)
+        header_fields = ["Message-ID", "In-Reply-To", "References", "Subject", "From", "To", "Cc", "Bcc", "Date"]
+        processed = 0
+        for batch_uids in chunked(uids, batch_size):
+            try:
+                batch_headers = fetch_headers_for_uids(session, batch_uids, header_fields)
+            except Exception as e:
+                logger.warning(f"Header fetch batch failed in '{mailbox}'; retrying singly. Error: {e}")
+                for u in batch_uids:
+                    try:
+                        single_headers = fetch_headers_for_uids(session, [u], header_fields)
+                    except Exception as e2:
+                        logger.error(f"Failed to fetch headers for UID {u} in '{mailbox}': {e2}")
+                        continue
+                    for (uid, headers_bytes) in single_headers:
+                        info = parse_headers_only(headers_bytes, uid, mailbox)
+                        global_uid_to_info[(mailbox, uid)] = info
+                        if info.message_id:
+                            global_msgid_to_info[info.message_id] = info
+                processed += len(batch_uids)
+                logger.info(f"Header pass '{mailbox}': {processed}/{total}")
+                continue
+
+            for (uid, headers_bytes) in batch_headers:
+                info = parse_headers_only(headers_bytes, uid, mailbox)
+                global_uid_to_info[(mailbox, uid)] = info
+                if info.message_id:
+                    global_msgid_to_info[info.message_id] = info
+
+            processed += len(batch_uids)
+            logger.info(f"Header pass '{mailbox}': {processed}/{total}")
+
+    # Compute conversation IDs globally
+    uid_to_conversation_id: Dict[Tuple[str, str], str] = {}
+    for key, info in global_uid_to_info.items():
+        root_mid = compute_root_message_id_for(info.uid, info, global_msgid_to_info)
         if root_mid:
             conv_id = sha256_hex("root:" + root_mid)
         else:
             parts = participants_set(info.from_addr, info.to_addrs, info.cc_addrs, info.bcc_addrs)
             conv_id = build_fallback_conversation_id(info.subject_canonical, parts, info.date_utc_iso)
-        uid_to_conversation_id[uid] = conv_id
+        uid_to_conversation_id[key] = conv_id
 
-    # 4) Pass 2: fetch full messages and write NDJSON
+    # Second pass: fetch full messages and write combined NDJSON
     fetch_ts_utc = dt.datetime.now(tz=dt.timezone.utc).isoformat().replace("+00:00", "Z")
     count_written = 0
     with open(out_path, "w", encoding="utf-8") as out_f:
-        processed = 0
-        for batch_uids in chunked(all_uids, batch_size):
+        for mailbox in mailboxes:
             try:
-                batch_full = fetch_full_for_uids(session, batch_uids, include_gmail=include_gmail)
+                session.select(mailbox)
             except Exception as e:
-                logger.warning(f"Full fetch batch failed; retrying singly. Error: {e}")
-                batch_full = []
-                for u in batch_uids:
+                logger.error(f"Skipping mailbox '{mailbox}' in full pass: {e}")
+                continue
+
+            _, data = session.uid("SEARCH", None, "ALL")
+            if not data or not data[0]:
+                continue
+            raw_uids = data[0].decode("ascii", errors="replace").strip().split()
+            uids = raw_uids
+            if limit is not None and limit > 0:
+                uids = uids[:limit]
+
+            total = len(uids)
+            processed = 0
+            logger.info(f"Full pass: mailbox '{mailbox}' with {total} messages")
+
+            for batch_uids in chunked(uids, batch_size):
+                try:
+                    batch_full = fetch_full_for_uids(session, batch_uids, include_gmail=include_gmail)
+                except Exception as e:
+                    logger.warning(f"Full fetch batch failed in '{mailbox}'; retrying singly. Error: {e}")
+                    batch_full = []
+                    for u in batch_uids:
+                        try:
+                            single_full = fetch_full_for_uids(session, [u], include_gmail=include_gmail)
+                            batch_full.extend(single_full)
+                        except Exception as e2:
+                            logger.error(f"Failed to fetch full message for UID {u} in '{mailbox}': {e2}")
+                            continue
+
+                for (uid, raw_bytes, flags, xgm_thrid) in batch_full:
                     try:
-                        single_full = fetch_full_for_uids(session, [u], include_gmail=include_gmail)
-                        batch_full.extend(single_full)
-                    except Exception as e2:
-                        logger.error(f"Failed to fetch full message for UID {u}: {e2}")
+                        msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
+                    except Exception as e:
+                        logger.error(f"Failed to parse message UID {uid} in '{mailbox}': {e}")
                         continue
 
-            for (uid, raw_bytes, flags, xgm_thrid) in batch_full:
-                try:
-                    msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
-                except Exception as e:
-                    logger.error(f"Failed to parse message UID {uid}: {e}")
-                    continue
+                    info = global_uid_to_info.get((mailbox, uid))
+                    if info is None:
+                        # Fallback: parse from full message
+                        subject = decode_mime_words(msg.get("Subject"))
+                        from_parsed = parse_addresses(msg.get("From"))
+                        from_addr = from_parsed[0] if from_parsed else {"name": "", "email": ""}
+                        to_addrs = parse_addresses(msg.get("To"))
+                        cc_addrs = parse_addresses(msg.get("Cc"))
+                        bcc_addrs = parse_addresses(msg.get("Bcc"))
+                        date_header, date_utc_iso = parse_date_to_utc(msg.get("Date"))
+                        message_id = canonical_message_id(extract_single_message_id(msg.get("Message-ID")))
+                        in_reply_to = canonical_message_id(extract_single_message_id(msg.get("In-Reply-To")))
+                        references = [canonical_message_id(r) or "" for r in extract_message_ids(msg.get("References"))]
+                        references = [r for r in references if r]
+                        subject_canonical = canonicalize_subject(subject)
+                        info = MinimalHeaderInfo(
+                            uid=uid,
+                            mailbox=mailbox,
+                            message_id=message_id,
+                            in_reply_to=in_reply_to,
+                            references=references,
+                            subject=subject,
+                            subject_canonical=subject_canonical,
+                            from_addr=from_addr,
+                            to_addrs=to_addrs,
+                            cc_addrs=cc_addrs,
+                            bcc_addrs=bcc_addrs,
+                            date_header=date_header,
+                            date_utc_iso=date_utc_iso,
+                        )
 
-                # Prefer header info from pass 1 to ensure consistency
-                info = uid_to_info.get(uid)
-                if info is None:
-                    # Fallback: parse from full message
-                    subject = decode_mime_words(msg.get("Subject"))
-                    from_parsed = parse_addresses(msg.get("From"))
-                    from_addr = from_parsed[0] if from_parsed else {"name": "", "email": ""}
-                    to_addrs = parse_addresses(msg.get("To"))
-                    cc_addrs = parse_addresses(msg.get("Cc"))
-                    bcc_addrs = parse_addresses(msg.get("Bcc"))
-                    date_header, date_utc_iso = parse_date_to_utc(msg.get("Date"))
-                    message_id = canonical_message_id(extract_single_message_id(msg.get("Message-ID")))
-                    in_reply_to = canonical_message_id(extract_single_message_id(msg.get("In-Reply-To")))
-                    references = [canonical_message_id(r) or "" for r in extract_message_ids(msg.get("References"))]
-                    references = [r for r in references if r]
-                    subject_canonical = canonicalize_subject(subject)
-                    info = MinimalHeaderInfo(
-                        uid=uid,
-                        mailbox=config.mailbox,
-                        message_id=message_id,
-                        in_reply_to=in_reply_to,
-                        references=references,
-                        subject=subject,
-                        subject_canonical=subject_canonical,
-                        from_addr=from_addr,
-                        to_addrs=to_addrs,
-                        cc_addrs=cc_addrs,
-                        bcc_addrs=bcc_addrs,
-                        date_header=date_header,
-                        date_utc_iso=date_utc_iso,
-                    )
+                    conv_id = uid_to_conversation_id.get((mailbox, uid))
+                    if not conv_id:
+                        parts = participants_set(info.from_addr, info.to_addrs, info.cc_addrs, info.bcc_addrs)
+                        conv_id = build_fallback_conversation_id(info.subject_canonical, parts, info.date_utc_iso)
 
-                conv_id = uid_to_conversation_id.get(uid)
-                if not conv_id:
-                    parts = participants_set(info.from_addr, info.to_addrs, info.cc_addrs, info.bcc_addrs)
-                    conv_id = build_fallback_conversation_id(info.subject_canonical, parts, info.date_utc_iso)
+                    bodies, attachments = extract_bodies_and_attachments(msg, attachments_dir, uid, mailbox)
 
-                bodies, attachments = extract_bodies_and_attachments(msg, attachments_dir, uid)
+                    record: Dict[str, Any] = {
+                        "uid": uid,
+                        "mailbox": info.mailbox,
+                        "message_id": info.message_id,
+                        "conversation_id": conv_id,
+                        "subject": info.subject,
+                        "subject_canonical": info.subject_canonical,
+                        "date_header": info.date_header,
+                        "date_utc": info.date_utc_iso,
+                        "from": info.from_addr,
+                        "to": info.to_addrs,
+                        "cc": info.cc_addrs,
+                        "bcc": info.bcc_addrs,
+                        "in_reply_to": info.in_reply_to,
+                        "references": info.references,
+                        "body_text": bodies.text,
+                        "body_html": bodies.html,
+                        "attachments": attachments,
+                        "flags": flags,
+                        "fetch_ts_utc": fetch_ts_utc,
+                        "provider_thread_id": xgm_thrid if xgm_thrid else None
+                    }
 
-                record: Dict[str, Any] = {
-                    "uid": uid,
-                    "mailbox": info.mailbox,
-                    "message_id": info.message_id,
-                    "conversation_id": conv_id,
-                    "subject": info.subject,
-                    "subject_canonical": info.subject_canonical,
-                    "date_header": info.date_header,
-                    "date_utc": info.date_utc_iso,
-                    "from": info.from_addr,
-                    "to": info.to_addrs,
-                    "cc": info.cc_addrs,
-                    "bcc": info.bcc_addrs,
-                    "in_reply_to": info.in_reply_to,
-                    "references": info.references,
-                    "body_text": bodies.text,
-                    "body_html": bodies.html,
-                    "attachments": attachments,
-                    "flags": flags,
-                    "fetch_ts_utc": fetch_ts_utc,
-                    "provider_thread_id": xgm_thrid if xgm_thrid else None
-                }
+                    out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    count_written += 1
 
-                out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                count_written += 1
+                processed += len(batch_uids)
+                logger.info(f"Export progress '{mailbox}': {processed}/{total} (written total: {count_written})")
 
-            processed += len(batch_uids)
-            logger.info(f"Export progress: {processed}/{total} (written: {count_written})")
-
-    logger.info(f"Done. Wrote {count_written} messages to {out_path}")
+    logger.info(f"Done. Wrote {count_written} messages from {len(mailboxes)} mailbox(es) to {out_path}")
 
 
 # -----------------------------
@@ -766,8 +805,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         description="Export IMAP mailbox to NDJSON with stable conversation IDs."
     )
     parser.add_argument("--out", required=True, help="Output NDJSON file path, e.g., messages.ndjson")
-    parser.add_argument("--mailbox", default=os.environ.get("IMAP_MAILBOX", "INBOX"),
-                        help="Mailbox name to select (default: INBOX or IMAP_MAILBOX env)")
+    parser.add_argument(
+        "--mailbox",
+        default=os.environ.get("IMAP_MAILBOX", "INBOX"),
+        help="Mailbox name to select (default: INBOX or IMAP_MAILBOX env). Use with --mailboxes to process multiple."
+    )
+    parser.add_argument(
+        "--mailboxes",
+        default=os.environ.get("IMAP_MAILBOXES", ""),
+        help="Comma-separated list of mailboxes to process in one run (e.g., 'INBOX,Sent,Archive'). Overrides --mailbox if provided."
+    )
     parser.add_argument("--limit", type=int, default=None, help="Optional cap on number of messages for testing")
     parser.add_argument("--attachments-dir", default=None, help="Directory to save attachments (optional)")
     parser.add_argument("--batch-size", type=int, default=500, help="Batch size for UID FETCH (default: 500)")
@@ -827,8 +874,16 @@ if __name__ == "__main__":
 
     try:
         config = read_imap_config(args, logger)
-        export_mailbox(
+        # Determine mailbox list
+        mailbox_list: List[str]
+        if args.mailboxes:
+            mailbox_list = [m.strip() for m in args.mailboxes.split(",") if m.strip()]
+        else:
+            mailbox_list = [config.mailbox]
+
+        export_mailboxes(
             config=config,
+            mailboxes=mailbox_list,
             out_path=args.out,
             limit=args.limit,
             attachments_dir=args.attachments_dir,
@@ -841,5 +896,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
-
-
