@@ -24,7 +24,7 @@ A powerful Python tool for extracting emails from IMAP servers with intelligent 
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
+git clone <https://github.com/grechkinet/smart_mail_extractor>
 cd smart_mail_extractor
 ```
 
