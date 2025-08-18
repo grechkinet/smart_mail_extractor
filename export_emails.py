@@ -4,6 +4,7 @@ import datetime as dt
 import email
 import email.policy
 import hashlib
+import unicodedata  # --- ADDED ---
 import html as html_module
 import imaplib
 import json
@@ -17,7 +18,7 @@ from dataclasses import dataclass
 from email.header import decode_header, make_header
 from email.message import EmailMessage, Message
 from email.utils import getaddresses, parsedate_to_datetime
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Set  # --- MODIFIED ---
 
 try:
     from bs4 import BeautifulSoup  # type: ignore
@@ -79,6 +80,74 @@ def sanitize_mailbox_for_path(mailbox: str) -> str:
     s = mailbox.strip().replace(os.sep, "_")
     s = re.sub(r"[^A-Za-z0-9_.-]+", "_", s)
     return s or "mailbox"
+
+
+# --- ADDED ---
+def mask_email_for_log(addr: str) -> str:
+    """Mask local part for logs: i***@example.com"""
+    if not addr or "@" not in addr:
+        return ""
+    local, domain = addr.split("@", 1)
+    local = local.strip()
+    if not local:
+        return f"*@{domain}"
+    prefix = local[0]
+    return f"{prefix}***@{domain}"
+
+
+# --- ADDED ---
+def canonical_email(addr: str) -> str:
+    """
+    Normalize e-mail:
+      1) strip + lower
+      2) Unicode NFC (unicodedata.normalize)
+      3) remove '+tag' for gmail-like domains
+      4) optionally: remove dots in local-part for gmail
+      5) simple regex validation; if invalid -> ""
+    """
+    if not addr:
+        return ""
+    try:
+        s = unicodedata.normalize("NFC", addr.strip().lower())
+        if "@" not in s:
+            return ""
+        local, domain = s.split("@", 1)
+        local = local.strip()
+        domain = domain.strip()
+        if not local or not domain:
+            return ""
+        # Gmail-like handling
+        gmail_like = domain in {"gmail.com", "googlemail.com"}
+        if gmail_like:
+            if "+" in local:
+                local = local.split("+", 1)[0]
+            local = local.replace(".", "")
+        # For non-gmail, keep dots; keep plus tag unless gmail-like
+        s_norm = f"{local}@{domain}"
+        # Simple validation
+        if not re.match(r"^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$", s_norm):
+            return ""
+        return s_norm
+    except Exception:
+        return ""
+
+
+# --- ADDED ---
+def email_domain(addr: str) -> str:
+    """Return domain (lower) or "" if not parseable."""
+    if not addr or "@" not in addr:
+        return ""
+    try:
+        _, domain = addr.strip().lower().split("@", 1)
+        return domain.strip()
+    except Exception:
+        return ""
+
+
+# --- ADDED ---
+def is_agency(addr: str, agency_domains: Set[str]) -> bool:
+    dom = email_domain(addr)
+    return bool(dom) and dom in agency_domains
 
 
 def parse_addresses(header_value: Optional[str]) -> List[Dict[str, str]]:
@@ -188,6 +257,35 @@ def participants_set(from_addr: Dict[str, str], to_addrs: List[Dict[str, str]],
     # unique + sorted
     uniq = sorted(set(e for e in emails if e))
     return uniq
+
+
+# --- ADDED ---
+def pick_customer_email(info: 'MinimalHeaderInfo', agency_domains: Set[str]) -> Optional[str]:
+    """
+    If From is NOT agency -> client = From.
+    Else -> client = first address from To|Cc|Bcc that is not agency.
+    Return canonical_email(...) or None.
+    """
+    from_email_raw = (info.from_addr.get("email") or "").strip()
+    if from_email_raw and not is_agency(from_email_raw, agency_domains):
+        ce = canonical_email(from_email_raw)
+        return ce or None
+    # scan recipients
+    for arr in (info.to_addrs, info.cc_addrs, info.bcc_addrs):
+        for a in arr:
+            addr = (a.get("email") or "").strip()
+            if addr and not is_agency(addr, agency_domains):
+                ce = canonical_email(addr)
+                if ce:
+                    return ce
+    return None
+
+
+# --- ADDED ---
+def session_id_from_customer(tenant: str, customer_id: str) -> str:
+    # Stable hash, only based on the customer:
+    # session_id = sha256("customer|" + tenant + "|" + customer_id)
+    return sha256_hex("customer|" + tenant + "|" + customer_id)
 
 
 def date_bucket_iso(date_utc_iso: Optional[str]) -> str:
@@ -614,6 +712,25 @@ def export_mailboxes(config: ImapConfig,
                     logger: logging.Logger) -> None:
     """Export one or more mailboxes, computing conversation IDs across all of them and writing a single NDJSON file."""
     session = ImapSession(config, logger)
+    # --- ADDED --- Agency domains config
+    agency_env = (os.environ.get("AGENCY_DOMAINS") or "").strip().lower()
+    agency_domains: Set[str] = set(d.strip() for d in agency_env.split(",") if d.strip())
+    # --- ADDED --- Tenant
+    tenant = (os.environ.get("TENANT") or "default").strip()
+    # --- ADDED --- CRM map
+    crm_map_path = (os.environ.get("CRM_EMAIL_MAP_PATH") or "").strip()
+    crm_map: Dict[str, str] = {}
+    if crm_map_path:
+        try:
+            with open(crm_map_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    # Expect keys are already normalized emails; coerce to str->str
+                    for k, v in data.items():
+                        if isinstance(k, str) and isinstance(v, str):
+                            crm_map[k] = v
+        except Exception as e:
+            logger.warning(f"Failed to load CRM map from {crm_map_path}: {e}")
     include_gmail = any(c == b"X-GM-EXT-1" for c in session.capabilities)
 
     # Global maps across all mailboxes
@@ -764,11 +881,29 @@ def export_mailboxes(config: ImapConfig,
 
                     bodies, attachments = extract_bodies_and_attachments(msg, attachments_dir, uid, mailbox)
 
+                    # --- ADDED --- customer detection and session id
+                    customer_email_norm = pick_customer_email(info, agency_domains)
+                    customer_id: Optional[str] = None
+                    if customer_email_norm:
+                        customer_id = crm_map.get(customer_email_norm, customer_email_norm)
+                        masked = mask_email_for_log(customer_email_norm)
+                        logger.debug(f"Detected customer for UID {uid}: {masked}; mapped id: {customer_id if customer_id != customer_email_norm else 'same'}")
+                    else:
+                        logger.debug(f"No external customer detected for UID {uid} (likely internal correspondence)")
+
+                    session_id: Optional[str] = None
+                    if customer_id:
+                        session_id = session_id_from_customer(tenant, customer_id)
+
                     record: Dict[str, Any] = {
                         "uid": uid,
                         "mailbox": info.mailbox,
                         "message_id": info.message_id,
                         "conversation_id": conv_id,
+                        # --- ADDED ---
+                        "customer_email_normalized": customer_email_norm,
+                        "customer_id": customer_id,
+                        "session_id": session_id,
                         "subject": info.subject,
                         "subject_canonical": info.subject_canonical,
                         "date_header": info.date_header,
