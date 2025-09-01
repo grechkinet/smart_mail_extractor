@@ -282,6 +282,64 @@ def pick_customer_email(info: 'MinimalHeaderInfo', agency_domains: Set[str]) -> 
 
 
 # --- ADDED ---
+def pick_agent_email(info: 'MinimalHeaderInfo', agency_domains: Set[str]) -> Optional[str]:
+    """
+    Prefer agency address as agent:
+      - If From is agency -> agent = From
+      - Else -> first address from To|Cc|Bcc that is agency
+    Return canonical_email(...) or None.
+    """
+    from_email_raw = (info.from_addr.get("email") or "").strip()
+    if from_email_raw and is_agency(from_email_raw, agency_domains):
+        ce = canonical_email(from_email_raw)
+        return ce or None
+    for arr in (info.to_addrs, info.cc_addrs, info.bcc_addrs):
+        for a in arr:
+            addr = (a.get("email") or "").strip()
+            if addr and is_agency(addr, agency_domains):
+                ce = canonical_email(addr)
+                if ce:
+                    return ce
+    return None
+
+
+# --- ADDED ---
+def pick_first_recipient_email(info: 'MinimalHeaderInfo') -> Optional[str]:
+    """Return the first canonical recipient from To|Cc|Bcc different from empty string."""
+    for arr in (info.to_addrs, info.cc_addrs, info.bcc_addrs):
+        for a in arr:
+            ce = canonical_email((a.get("email") or "").strip())
+            if ce:
+                return ce
+    return None
+
+
+# --- ADDED ---
+def compute_pair_conversation_id(info: 'MinimalHeaderInfo', agency_domains: Set[str]) -> Optional[str]:
+    """
+    Compute ConversationID solely from the pair of email addresses involved.
+    Priority:
+      1) Use (agent, customer) pair if agency domains can identify roles
+      2) Fallback to (From, first recipient) pair
+    The pair is unordered, so A<->B equals B<->A.
+    """
+    # Try to determine roles if agency domains are configured
+    customer = pick_customer_email(info, agency_domains)
+    agent = pick_agent_email(info, agency_domains)
+    if customer and agent:
+        a, b = sorted([agent, customer])
+        return sha256_hex("pair:" + a + "|" + b)
+
+    # Generic fallback: From + first recipient
+    from_norm = canonical_email((info.from_addr.get("email") or "").strip())
+    recip_norm = pick_first_recipient_email(info)
+    if from_norm and recip_norm:
+        a, b = sorted([from_norm, recip_norm])
+        return sha256_hex("pair:" + a + "|" + b)
+
+    return None
+
+# --- ADDED ---
 def session_id_from_customer(tenant: str, customer_id: str) -> str:
     # Stable hash, only based on the customer:
     # session_id = sha256("customer|" + tenant + "|" + customer_id)
@@ -789,14 +847,9 @@ def export_mailboxes(config: ImapConfig,
             logger.info(f"Header pass '{mailbox}': {processed}/{total}")
 
     # Compute conversation IDs globally
-    uid_to_conversation_id: Dict[Tuple[str, str], str] = {}
+    uid_to_conversation_id: Dict[Tuple[str, str], Optional[str]] = {}
     for key, info in global_uid_to_info.items():
-        root_mid = compute_root_message_id_for(info.uid, info, global_msgid_to_info)
-        if root_mid:
-            conv_id = sha256_hex("root:" + root_mid)
-        else:
-            parts = participants_set(info.from_addr, info.to_addrs, info.cc_addrs, info.bcc_addrs)
-            conv_id = build_fallback_conversation_id(info.subject_canonical, parts, info.date_utc_iso)
+        conv_id = compute_pair_conversation_id(info, agency_domains)
         uid_to_conversation_id[key] = conv_id
 
     # Second pass: fetch full messages and write combined NDJSON
@@ -876,8 +929,7 @@ def export_mailboxes(config: ImapConfig,
 
                     conv_id = uid_to_conversation_id.get((mailbox, uid))
                     if not conv_id:
-                        parts = participants_set(info.from_addr, info.to_addrs, info.cc_addrs, info.bcc_addrs)
-                        conv_id = build_fallback_conversation_id(info.subject_canonical, parts, info.date_utc_iso)
+                        conv_id = compute_pair_conversation_id(info, agency_domains)
 
                     bodies, attachments = extract_bodies_and_attachments(msg, attachments_dir, uid, mailbox)
 
